@@ -1,0 +1,42 @@
+{
+  "name": "pi-x-search",
+  "version": "0.1.0",
+  "description": "Senpi/Pi extension that exposes xAI X Search through xai-oauth or XAI_API_KEY credentials.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": "./src/index.ts",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "verify": "npm run check && npm test"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "senpi",
+    "pi-extension",
+    "xai",
+    "grok",
+    "x-search"
+  ],
+  "author": "Steve <steve-8000>",
+  "license": "MIT",
+  "peerDependencies": {
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.3",
+    "typebox": "^1.1.24",
+    "typescript": "^5.9.2"
+  }
+}
