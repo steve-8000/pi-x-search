@@ -1,14 +1,22 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import xSearchExtension, {
 	DEFAULT_X_SEARCH_MODEL,
+	buildXSearchDeepChunkQuery,
+	buildXSearchDeepCountQuery,
 	buildXSearchPayload,
 	buildXSearchToolDefinition,
+	containsTruncationMarker,
+	executeXSearchDeep,
 	executeXSearch,
 	extractInlineCitations,
 	extractResponseText,
 	normalizeHandles,
+	parseDeepCharCount,
 	parseXaiAuthorizationInput,
 	resolveXaiCredential,
 	xaiOAuthProvider,
@@ -49,11 +57,14 @@ test("resolveXaiCredential falls back to xai API key", async () => {
 
 test("xSearchExtension registers xai-oauth login provider", () => {
 	const providers: Array<Parameters<NonNullable<ExtensionApiLike["registerProvider"]>>> = [];
+	const tools: string[] = [];
 	const pi: ExtensionApiLike = {
 		registerProvider(...args) {
 			providers.push(args);
 		},
-		registerTool() {},
+		registerTool(tool) {
+			tools.push(tool.name);
+		},
 	};
 
 	xSearchExtension(pi);
@@ -63,6 +74,7 @@ test("xSearchExtension registers xai-oauth login provider", () => {
 	assert.equal(providers[0]?.[1].oauth?.name, "xAI Grok OAuth");
 	assert.equal(providers[0]?.[1].oauth?.usesCallbackServer, true);
 	assert.equal(providers[0]?.[1].oauth?.getApiKey({ access: "oauth-token", refresh: "refresh", expires: 0 }), "oauth-token");
+	assert.deepEqual(tools, ["x_search", "x_search_deep"]);
 });
 
 test("parseXaiAuthorizationInput accepts redirect URLs, query strings, and raw codes", () => {
@@ -115,6 +127,17 @@ test("buildXSearchPayload uses grok-4.3, store:false, and x_search tool", () => 
 			enable_image_understanding: true,
 		},
 	]);
+});
+
+test("x_search_deep helpers build metadata and chunk prompts", () => {
+	const countQuery = buildXSearchDeepCountQuery("https://x.com/xai/status/1");
+	const chunkQuery = buildXSearchDeepChunkQuery("https://x.com/xai/status/1", 101, 200);
+
+	assert.match(countQuery, /Return ONLY compact JSON/);
+	assert.match(countQuery, /char_count/);
+	assert.match(chunkQuery, /characters 101 through 200/);
+	assert.equal(parseDeepCharCount('{"char_count": "1,234"}'), 1234);
+	assert.equal(containsTruncationMarker("before <truncated:5668 bytes original> after"), true);
 });
 
 test("extractors read output_text and inline citations", () => {
@@ -176,6 +199,100 @@ test("executeXSearch sends xAI Responses request without leaking credentials", a
 		store: false,
 	});
 	assert.doesNotMatch(result.content[0]?.text ?? "", /oauth-secret|api-secret/);
+});
+
+test("executeXSearchDeep gets char count, requests chunks, and merges full_text", async () => {
+	const chunk1 = "A".repeat(200);
+	const chunk2 = "B".repeat(200);
+	const chunk3 = "C";
+	const requestedPrompts: string[] = [];
+	const fetchImpl: FetchLike = async (_url, init) => {
+		const body = JSON.parse(init.body) as { input: Array<{ content: string }> };
+		const prompt = body.input[0]?.content ?? "";
+		requestedPrompts.push(prompt);
+
+		let outputText = '{"char_count": 401}';
+		if (prompt.includes("characters 1 through 200")) outputText = chunk1;
+		if (prompt.includes("characters 201 through 400")) outputText = chunk2;
+		if (prompt.includes("characters 401 through 600")) outputText = chunk3;
+
+		return {
+			ok: true,
+			status: 200,
+			async text() {
+				return JSON.stringify({ id: `resp_${requestedPrompts.length}`, output_text: outputText });
+			},
+		};
+	};
+
+	const result = await executeXSearchDeep(
+		{ query: "https://x.com/xai/status/1", chunk_size: 200, max_chunks: 5, output_mode: "inline" },
+		createContext({ "xai-oauth": "oauth-secret" }),
+		{ fetchImpl, timeoutMs: 1_000, retries: 0 },
+	);
+
+	assert.equal(result.isError, undefined);
+	assert.equal(result.details.success, true);
+	assert.equal(result.details.tool, "x_search_deep");
+	if (result.details.success && result.details.tool === "x_search_deep") {
+		assert.equal(result.details.char_count, 401);
+		assert.equal(result.details.chunks_requested, 3);
+		assert.equal(result.details.full_text, `${chunk1}${chunk2}${chunk3}`);
+		assert.equal(result.details.complete, true);
+		assert.deepEqual(result.details.warnings, []);
+	}
+	assert.equal(requestedPrompts.length, 4);
+	assert.match(requestedPrompts[0] ?? "", /char_count/);
+	assert.match(requestedPrompts[3] ?? "", /characters 401 through 600/);
+});
+
+test("executeXSearchDeep file mode writes markdown and returns compact details", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-x-search-"));
+	try {
+		const outputPath = join(tempDir, "post.md");
+		const fetchImpl: FetchLike = async (_url, init) => {
+			const body = JSON.parse(init.body) as { input: Array<{ content: string }> };
+			const prompt = body.input[0]?.content ?? "";
+			let outputText = '{"char_count": 250}';
+			if (prompt.includes("characters 1 through 200")) outputText = "A".repeat(200);
+			if (prompt.includes("characters 201 through 400")) outputText = "B".repeat(50);
+
+			return {
+				ok: true,
+				status: 200,
+				async text() {
+					return JSON.stringify({ id: "resp_file", output_text: outputText });
+				},
+			};
+		};
+
+		const result = await executeXSearchDeep(
+			{ query: "https://x.com/xai/status/2", chunk_size: 200, max_chunks: 3, output_mode: "file", output_path: outputPath },
+			createContext({ "xai-oauth": "oauth-secret" }),
+			{ fetchImpl, timeoutMs: 1_000, retries: 0 },
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details.success, true);
+		assert.equal(result.details.tool, "x_search_deep");
+		if (result.details.success && result.details.tool === "x_search_deep") {
+			assert.equal(result.details.output_mode, "file");
+			assert.equal(result.details.output_path, outputPath);
+			assert.equal(result.details.full_text, undefined);
+			assert.equal(result.details.chunks_written, 2);
+			assert.equal(result.details.chunks[0]?.text, "");
+			assert.match(result.details.answer, /wrote 2 chunks/);
+		}
+
+		const markdown = await readFile(outputPath, "utf8");
+		assert.match(markdown, /# X Search Deep Result/);
+		assert.match(markdown, /Reported char_count: 250/);
+		assert.match(markdown, /<!-- chunk 1: chars 1-200; truncated=false -->/);
+		assert.match(markdown, /A{200}/);
+		assert.match(markdown, /B{50}/);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
 });
 
 test("executeXSearch reports auth_required when no credential exists", async () => {

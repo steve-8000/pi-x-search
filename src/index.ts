@@ -1,3 +1,5 @@
+import { mkdir, writeFile, appendFile } from "node:fs/promises";
+import { dirname, isAbsolute, join } from "node:path";
 import { Type } from "typebox";
 import { xaiOAuthProvider, type OAuthCredentials, type OAuthLoginCallbacks } from "./xai-oauth.js";
 
@@ -9,8 +11,18 @@ export const DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1";
 export const DEFAULT_TIMEOUT_MS = 180_000;
 export const DEFAULT_RETRIES = 2;
 export const MAX_HANDLES = 10;
+export const DEFAULT_DEEP_CHUNK_SIZE = 900;
+export const DEFAULT_DEEP_MAX_CHUNKS = 12;
+export const DEFAULT_DEEP_OVERLAP_CHARS = 0;
+export const MIN_DEEP_CHUNK_SIZE = 200;
+export const MAX_DEEP_CHUNK_SIZE = 2_000;
+export const MAX_DEEP_MAX_CHUNKS = 50;
+export const MAX_DEEP_OVERLAP_CHARS = 200;
+export const DEFAULT_DEEP_OUTPUT_MODE = "file";
 
 export type CredentialSource = "xai-oauth" | "xai";
+export type XSearchToolName = "x_search" | "x_search_deep";
+export type XSearchDeepOutputMode = "inline" | "file";
 
 export type XSearchParams = {
 	query: string;
@@ -20,6 +32,15 @@ export type XSearchParams = {
 	to_date?: string;
 	enable_image_understanding?: boolean;
 	enable_video_understanding?: boolean;
+	return_full_text?: boolean;
+};
+
+export type XSearchDeepParams = XSearchParams & {
+	chunk_size?: number;
+	max_chunks?: number;
+	overlap_chars?: number;
+	output_mode?: XSearchDeepOutputMode;
+	output_path?: string;
 };
 
 export type XSearchToolDefinition = {
@@ -30,6 +51,7 @@ export type XSearchToolDefinition = {
 	to_date?: string;
 	enable_image_understanding?: true;
 	enable_video_understanding?: true;
+	return_full_text?: true;
 };
 
 export type XSearchRequestPayload = {
@@ -63,7 +85,7 @@ export type XSearchFailure = {
 	success: false;
 	provider: "xai";
 	credential_source?: CredentialSource;
-	tool: "x_search";
+	tool: XSearchToolName;
 	model?: string;
 	query?: string;
 	error: string;
@@ -71,7 +93,41 @@ export type XSearchFailure = {
 	status?: number;
 };
 
-export type XSearchDetails = XSearchSuccess | XSearchFailure;
+export type XSearchDeepChunk = {
+	index: number;
+	start: number;
+	end: number;
+	text: string;
+	response_id?: string;
+	truncated: boolean;
+};
+
+export type XSearchDeepSuccess = {
+	success: true;
+	provider: "xai";
+	credential_source: CredentialSource;
+	tool: "x_search_deep";
+	model: string;
+	query: string;
+	char_count?: number;
+	chunk_size: number;
+	max_chunks: number;
+	overlap_chars: number;
+	chunks_requested: number;
+	complete: boolean;
+	output_mode: XSearchDeepOutputMode;
+	output_path?: string;
+	bytes_written?: number;
+	full_text?: string;
+	answer: string;
+	chunks: XSearchDeepChunk[];
+	chunks_written?: number;
+	warnings: string[];
+	citations: unknown[];
+	inline_citations: InlineCitation[];
+};
+
+export type XSearchDetails = XSearchSuccess | XSearchDeepSuccess | XSearchFailure;
 
 export type ToolResult = {
 	content: Array<{ type: "text"; text: string }>;
@@ -113,10 +169,10 @@ export type ExtensionApiLike = {
 		description: string;
 		promptSnippet?: string;
 		promptGuidelines?: string[];
-		parameters: typeof XSearchParametersSchema;
+		parameters: unknown;
 		execute(
 			toolCallId: string,
-			params: XSearchParams,
+			params: XSearchParams | XSearchDeepParams,
 			signal: AbortSignal | undefined,
 			onUpdate: unknown,
 			ctx: ExtensionContextLike,
@@ -174,6 +230,60 @@ export const XSearchParametersSchema = Type.Object({
 	enable_video_understanding: Type.Optional(
 		Type.Boolean({ description: "Ask xAI x_search to use video understanding when available." }),
 	),
+	return_full_text: Type.Optional(
+		Type.Boolean({ description: "Return the complete original post text verbatim instead of a summary." }),
+	),
+});
+
+export const XSearchDeepParametersSchema = Type.Object({
+	query: Type.String({ description: "The X/Twitter status URL or search query whose complete post text should be reconstructed." }),
+	allowed_x_handles: Type.Optional(
+		Type.Array(Type.String({ description: "X handle to allow, with or without @." }), {
+			description: "Optional allow-list of X handles. Cannot be combined with excluded_x_handles.",
+		}),
+	),
+	excluded_x_handles: Type.Optional(
+		Type.Array(Type.String({ description: "X handle to exclude, with or without @." }), {
+			description: "Optional block-list of X handles. Cannot be combined with allowed_x_handles.",
+		}),
+	),
+	from_date: Type.Optional(Type.String({ description: "Optional start date filter accepted by xAI x_search." })),
+	to_date: Type.Optional(Type.String({ description: "Optional end date filter accepted by xAI x_search." })),
+	enable_image_understanding: Type.Optional(
+		Type.Boolean({ description: "Ask xAI x_search to use image understanding when available." }),
+	),
+	enable_video_understanding: Type.Optional(
+		Type.Boolean({ description: "Ask xAI x_search to use video understanding when available." }),
+	),
+	chunk_size: Type.Optional(
+		Type.Number({
+			description: `Characters to request per chunk. Defaults to ${DEFAULT_DEEP_CHUNK_SIZE}.`,
+			minimum: MIN_DEEP_CHUNK_SIZE,
+			maximum: MAX_DEEP_CHUNK_SIZE,
+		}),
+	),
+	max_chunks: Type.Optional(
+		Type.Number({
+			description: `Maximum chunks to request. Defaults to ${DEFAULT_DEEP_MAX_CHUNKS}.`,
+			minimum: 1,
+			maximum: MAX_DEEP_MAX_CHUNKS,
+		}),
+	),
+	overlap_chars: Type.Optional(
+		Type.Number({
+			description: `Characters of overlap between adjacent chunks for manual verification. Defaults to ${DEFAULT_DEEP_OVERLAP_CHARS}.`,
+			minimum: 0,
+			maximum: MAX_DEEP_OVERLAP_CHARS,
+		}),
+	),
+	output_mode: Type.Optional(
+		Type.Union([Type.Literal("inline"), Type.Literal("file")], {
+			description: `Where to place reconstructed text. Defaults to ${DEFAULT_DEEP_OUTPUT_MODE} to avoid large tool-response truncation.`,
+		}),
+	),
+	output_path: Type.Optional(
+		Type.String({ description: "Optional Markdown file path for output_mode=file. Relative paths resolve from the current working directory." }),
+	),
 });
 
 function getEnv(name: string): string | undefined {
@@ -185,10 +295,21 @@ function nonEmptyEnv(name: string): string | undefined {
 	return value ? value : undefined;
 }
 
+function cwd(): string {
+	return typeof process !== "undefined" ? process.cwd() : ".";
+}
+
 function parsePositiveInt(value: string | undefined, fallback: number): number {
 	if (!value) return fallback;
 	const parsed = Number.parseInt(value, 10);
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseBoundedInt(value: number | undefined, fallback: number, min: number, max: number): number {
+	if (value === undefined) return fallback;
+	const parsed = Math.trunc(value);
+	if (!Number.isFinite(parsed)) return fallback;
+	return Math.min(max, Math.max(min, parsed));
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -209,6 +330,65 @@ function asArray(value: unknown): unknown[] {
 
 function normalizeBaseUrl(baseUrl: string): string {
 	return baseUrl.trim().replace(/\/+$/, "") || DEFAULT_XAI_BASE_URL;
+}
+
+function sanitizeFilePart(value: string): string {
+	return value.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "x-post";
+}
+
+function extractStatusId(query: string): string | undefined {
+	return query.match(/status\/(\d+)/)?.[1];
+}
+
+export function resolveDeepOutputPath(params: XSearchDeepParams): string {
+	const outputPath = params.output_path?.trim();
+	if (outputPath) return isAbsolute(outputPath) ? outputPath : join(cwd(), outputPath);
+
+	const outputDir = nonEmptyEnv("PI_X_SEARCH_DEEP_OUTPUT_DIR") ?? join(cwd(), "x-search-deep-results");
+	const id = extractStatusId(params.query) ?? sanitizeFilePart(params.query);
+	return join(outputDir, `${id}.md`);
+}
+
+async function writeMarkdownHeader(path: string, params: XSearchDeepParams, meta: { charCount: number | undefined; chunkSize: number; maxChunks: number; overlapChars: number; chunksRequested: number }): Promise<void> {
+	await mkdir(dirname(path), { recursive: true });
+	const lines = [
+		"# X Search Deep Result",
+		"",
+		`Query: ${params.query.trim()}`,
+		`Generated at: ${new Date().toISOString()}`,
+		`Reported char_count: ${meta.charCount ?? "unknown"}`,
+		`Chunk size: ${meta.chunkSize}`,
+		`Max chunks: ${meta.maxChunks}`,
+		`Overlap chars: ${meta.overlapChars}`,
+		`Chunks requested: ${meta.chunksRequested}`,
+		"",
+		"## Reconstructed Text",
+		"",
+	];
+	await writeFile(path, lines.join("\n"), "utf8");
+}
+
+async function appendMarkdownChunk(path: string, chunk: XSearchDeepChunk): Promise<number> {
+	const content = [
+		`\n<!-- chunk ${chunk.index + 1}: chars ${chunk.start}-${chunk.end}; truncated=${chunk.truncated} -->\n`,
+		chunk.text,
+		"\n",
+	].join("");
+	await appendFile(path, content, "utf8");
+	return Buffer.byteLength(content, "utf8");
+}
+
+async function appendMarkdownWarnings(path: string, warnings: readonly string[], complete: boolean): Promise<number> {
+	const lines = ["", "## Retrieval Status", "", `Complete: ${complete}`, "", "## Warnings", ""];
+	if (warnings.length === 0) {
+		lines.push("- None");
+	} else {
+		for (const warning of warnings) lines.push(`- ${warning}`);
+	}
+	lines.push("");
+	const content = lines.join("\n");
+	await appendFile(path, content, "utf8");
+	return Buffer.byteLength(content, "utf8");
 }
 
 function jsonToolResult(details: XSearchDetails): ToolResult {
@@ -251,13 +431,17 @@ export function buildXSearchToolDefinition(params: XSearchParams): XSearchToolDe
 
 	if (params.enable_image_understanding === true) tool.enable_image_understanding = true;
 	if (params.enable_video_understanding === true) tool.enable_video_understanding = true;
+	if (params.return_full_text === true) tool.return_full_text = true;
 	return tool;
 }
 
 export function buildXSearchPayload(params: XSearchParams, model: string): XSearchRequestPayload {
-	const query = params.query.trim();
+	let query = params.query.trim();
 	if (!query) {
 		throw new Error("query is required");
+	}
+	if (params.return_full_text === true) {
+		query = "Return the complete original post text verbatim. Do not summarize, truncate, or rewrite. Output only the full raw text of the matching X post(s).\n\n" + query;
 	}
 	return {
 		model,
@@ -265,6 +449,63 @@ export function buildXSearchPayload(params: XSearchParams, model: string): XSear
 		tools: [buildXSearchToolDefinition(params)],
 		store: false,
 	};
+}
+
+export function containsTruncationMarker(text: string): boolean {
+	return /<truncated:\d+ bytes original>/i.test(text);
+}
+
+export function parseDeepCharCount(text: string): number | undefined {
+	const jsonMatch = text.match(/\{[\s\S]*\}/);
+	if (jsonMatch) {
+		try {
+			const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+			const charCount = parsed.char_count;
+			if (typeof charCount === "number" && Number.isFinite(charCount) && charCount > 0) {
+				return Math.trunc(charCount);
+			}
+			if (typeof charCount === "string") {
+				const numeric = Number.parseInt(charCount.replace(/[^\d]/g, ""), 10);
+				return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
+			}
+		} catch {
+			// Fall through to regex parsing for model outputs with non-strict JSON.
+		}
+	}
+
+	const labeledMatch = text.match(/char[_\s-]*count["'\s:=]+([\d,]+)/i);
+	if (!labeledMatch?.[1]) return undefined;
+	const numeric = Number.parseInt(labeledMatch[1].replace(/,/g, ""), 10);
+	return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
+}
+
+export function resolveDeepOptions(params: XSearchDeepParams): { chunkSize: number; maxChunks: number; overlapChars: number } {
+	const chunkSize = parseBoundedInt(params.chunk_size, DEFAULT_DEEP_CHUNK_SIZE, MIN_DEEP_CHUNK_SIZE, MAX_DEEP_CHUNK_SIZE);
+	const maxChunks = parseBoundedInt(params.max_chunks, DEFAULT_DEEP_MAX_CHUNKS, 1, MAX_DEEP_MAX_CHUNKS);
+	const overlapChars = parseBoundedInt(params.overlap_chars, DEFAULT_DEEP_OVERLAP_CHARS, 0, Math.min(MAX_DEEP_OVERLAP_CHARS, chunkSize - 1));
+	return { chunkSize, maxChunks, overlapChars };
+}
+
+export function buildXSearchDeepCountQuery(query: string): string {
+	return [
+		"Find the exact X/Twitter post matching the query below.",
+		"Return ONLY compact JSON, with no markdown and no post body.",
+		"Schema: {\"char_count\": number}",
+		"char_count must be the number of Unicode characters in the original post text, excluding quoted/reposted surrounding UI text.",
+		"",
+		query.trim(),
+	].join("\n");
+}
+
+export function buildXSearchDeepChunkQuery(query: string, start: number, end: number): string {
+	return [
+		"Find the exact X/Twitter post matching the query below.",
+		`Return ONLY Unicode characters ${start} through ${end}, inclusive, from the original post text.`,
+		"Do not summarize, rewrite, add ellipses, add markdown, add labels, or include any surrounding UI text.",
+		"If this range starts after the end of the post, return an empty string.",
+		"",
+		query.trim(),
+	].join("\n");
 }
 
 export async function resolveXaiCredential(ctx: ExtensionContextLike): Promise<ResolvedCredential | undefined> {
@@ -480,6 +721,7 @@ function failureFromUnknown(
 	params: XSearchParams,
 	model: string,
 	credentialSource?: CredentialSource,
+	tool: XSearchToolName = "x_search",
 ): XSearchFailure {
 	const errorRecord = asRecord(error);
 	const status = asNumber(errorRecord?.status);
@@ -487,7 +729,7 @@ function failureFromUnknown(
 	const details: XSearchFailure = {
 		success: false,
 		provider: "xai",
-		tool: "x_search",
+		tool,
 		model,
 		query: params.query,
 		error: data !== undefined ? errorMessageFromData(data) : error instanceof Error ? error.message : String(error),
@@ -562,6 +804,152 @@ export async function executeXSearch(
 	}
 }
 
+export async function executeXSearchDeep(
+	params: XSearchDeepParams,
+	ctx: ExtensionContextLike,
+	options: ExecuteOptions = {},
+): Promise<ToolResult> {
+	const model = options.model ?? resolveModel();
+	let credentialSource: CredentialSource | undefined;
+	try {
+		const query = params.query.trim();
+		if (!query) {
+			return jsonToolResult({
+				success: false,
+				provider: "xai",
+				tool: "x_search_deep",
+				model,
+				error: "query is required",
+				error_type: "validation_error",
+			});
+		}
+
+		const credential = await resolveXaiCredential(ctx);
+		if (!credential) {
+			return jsonToolResult({
+				success: false,
+				provider: "xai",
+				tool: "x_search_deep",
+				model,
+				query,
+				error: "No xAI credentials found. Run /login and choose xAI Grok OAuth, or configure XAI_API_KEY for provider xai.",
+				error_type: "auth_required",
+			});
+		}
+		credentialSource = credential.source;
+
+		const fetchImpl = options.fetchImpl ?? (globalThis.fetch as FetchLike | undefined);
+		if (!fetchImpl) {
+			return jsonToolResult({
+				success: false,
+				provider: "xai",
+				credential_source: credential.source,
+				tool: "x_search_deep",
+				model,
+				query,
+				error: "global fetch is not available in this runtime",
+				error_type: "runtime_error",
+			});
+		}
+
+		const timeoutMs = options.timeoutMs ?? parsePositiveInt(nonEmptyEnv("PI_X_SEARCH_TIMEOUT_MS"), DEFAULT_TIMEOUT_MS);
+		const retries = options.retries ?? parsePositiveInt(nonEmptyEnv("PI_X_SEARCH_RETRIES"), DEFAULT_RETRIES);
+		const baseUrl = resolveBaseUrl(ctx, model, options.baseUrl);
+		const { chunkSize, maxChunks, overlapChars } = resolveDeepOptions(params);
+		const outputMode: XSearchDeepOutputMode = params.output_mode ?? DEFAULT_DEEP_OUTPUT_MODE;
+		const outputPath = outputMode === "file" ? resolveDeepOutputPath(params) : undefined;
+		const baseParams: XSearchParams = { ...params, query, return_full_text: true };
+
+		const callPrompt = async (prompt: string): Promise<XSearchSuccess> => {
+			const payload = buildXSearchPayload({ ...baseParams, query: prompt, return_full_text: true }, model);
+			const response = await callXaiResponses(fetchImpl, baseUrl, credential.apiKey, payload, {
+				signal: options.signal,
+				timeoutMs,
+				retries,
+			});
+			return buildSuccessDetails(response.data, { ...baseParams, query: prompt }, credential.source, model);
+		};
+
+		const warnings: string[] = [];
+		const metadata = await callPrompt(buildXSearchDeepCountQuery(query));
+		const charCount = parseDeepCharCount(metadata.answer);
+		if (charCount === undefined) {
+			warnings.push("Could not parse char_count from the metadata response; max_chunks will cap retrieval.");
+		}
+		if (containsTruncationMarker(metadata.answer)) {
+			warnings.push("The metadata response contained a truncation marker; char_count may be unreliable.");
+		}
+
+		const requiredChunks = charCount === undefined ? maxChunks : Math.ceil(charCount / Math.max(1, chunkSize - overlapChars));
+		const chunksRequested = Math.min(maxChunks, Math.max(1, requiredChunks));
+		if (charCount !== undefined && requiredChunks > maxChunks) {
+			warnings.push(`Post requires ${requiredChunks} chunks at chunk_size=${chunkSize}, but max_chunks=${maxChunks} capped retrieval.`);
+		}
+		if (outputPath) {
+			await writeMarkdownHeader(outputPath, params, { charCount, chunkSize, maxChunks, overlapChars, chunksRequested });
+		}
+
+		const chunks: XSearchDeepChunk[] = [];
+		let bytesWritten = 0;
+		for (let index = 0; index < chunksRequested; index += 1) {
+			const start = index * (chunkSize - overlapChars) + 1;
+			const end = start + chunkSize - 1;
+			const chunk = await callPrompt(buildXSearchDeepChunkQuery(query, start, end));
+			const truncated = containsTruncationMarker(chunk.answer);
+			if (truncated) warnings.push(`Chunk ${index + 1} contained a truncation marker.`);
+			const chunkRecord: XSearchDeepChunk = {
+				index,
+				start,
+				end,
+				text: outputMode === "file" ? "" : chunk.answer,
+				...(chunk.response_id ? { response_id: chunk.response_id } : {}),
+				truncated,
+			};
+			chunks.push({
+				...chunkRecord,
+			});
+			if (outputPath) bytesWritten += await appendMarkdownChunk(outputPath, { ...chunkRecord, text: chunk.answer });
+			if (charCount === undefined && !chunk.answer) break;
+		}
+
+		const fullText = chunks.map((chunk, index) => (index > 0 && overlapChars > 0 ? chunk.text.slice(overlapChars) : chunk.text)).join("");
+		if (charCount !== undefined && fullText.length < Math.floor(charCount * 0.85)) {
+			if (outputMode === "inline") warnings.push(`Merged text length (${fullText.length}) is much shorter than reported char_count (${charCount}).`);
+		}
+		const complete = warnings.length === 0 && (charCount === undefined || chunksRequested >= requiredChunks);
+		if (outputPath) bytesWritten += await appendMarkdownWarnings(outputPath, warnings, complete);
+		const answer = outputPath
+			? `x_search_deep wrote ${chunks.length} chunks to ${outputPath}. complete=${complete}. warnings=${warnings.length}.`
+			: fullText;
+
+		const details: XSearchDeepSuccess = {
+			success: true,
+			provider: "xai",
+			credential_source: credential.source,
+			tool: "x_search_deep",
+			model,
+			query,
+			...(charCount !== undefined ? { char_count: charCount } : {}),
+			chunk_size: chunkSize,
+			max_chunks: maxChunks,
+			overlap_chars: overlapChars,
+			chunks_requested: chunksRequested,
+			complete,
+			output_mode: outputMode,
+			...(outputPath ? { output_path: outputPath, bytes_written: bytesWritten, chunks_written: chunks.length } : { full_text: fullText }),
+			answer,
+			chunks,
+			warnings,
+			citations: metadata.citations,
+			inline_citations: metadata.inline_citations,
+		};
+
+		return jsonToolResult(details);
+	} catch (error) {
+		return jsonToolResult(failureFromUnknown(error, params, model, credentialSource, "x_search_deep"));
+	}
+}
+
 export default function xSearchExtension(pi: ExtensionApiLike): void {
 	pi.registerProvider?.("xai-oauth", {
 		name: xaiOAuthProvider.name,
@@ -579,10 +967,30 @@ export default function xSearchExtension(pi: ExtensionApiLike): void {
 			"Use x_search for current information from X/Twitter instead of guessing.",
 			"Use allowed_x_handles when the user asks about specific X accounts.",
 			"Do not combine allowed_x_handles and excluded_x_handles in the same call.",
+			"Set return_full_text: true when you need the complete original post text instead of a summary.",
 		],
 		parameters: XSearchParametersSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			return signal ? executeXSearch(params, ctx, { signal }) : executeXSearch(params, ctx);
+			return signal ? executeXSearch(params as XSearchParams, ctx, { signal }) : executeXSearch(params as XSearchParams, ctx);
+		},
+	});
+
+	pi.registerTool({
+		name: "x_search_deep",
+		label: "X Search Deep",
+		description:
+			"Retrieve long X/Twitter post text through xAI x_search using a metadata pass and chunked range requests, then merge the chunks into one response.",
+		promptSnippet:
+			"Use x_search_deep when a long X/Twitter post must be reconstructed beyond normal x_search response truncation.",
+		promptGuidelines: [
+			"Use x_search_deep for long posts where x_search returns a <truncated:...> marker.",
+			"Prefer a direct status URL in query so the chunked requests target one exact post.",
+			"Increase max_chunks when the reported char_count exceeds chunk_size * max_chunks.",
+			"Check complete and warnings before treating full_text as authoritative.",
+		],
+		parameters: XSearchDeepParametersSchema,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			return signal ? executeXSearchDeep(params as XSearchDeepParams, ctx, { signal }) : executeXSearchDeep(params as XSearchDeepParams, ctx);
 		},
 	});
 }
