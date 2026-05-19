@@ -4,7 +4,10 @@
   "description": "Senpi/Pi extension that exposes xAI X Search through xai-oauth or XAI_API_KEY credentials.",
   "type": "module",
   "main": "./src/index.ts",
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./xai-oauth": "./src/xai-oauth.ts"
+  },
   "files": [
     "src",
     "README.md",

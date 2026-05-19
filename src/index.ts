@@ -1,4 +1,8 @@
 import { Type } from "typebox";
+import { xaiOAuthProvider, type OAuthCredentials, type OAuthLoginCallbacks } from "./xai-oauth.js";
+
+export { loginXaiOAuth, parseXaiAuthorizationInput, refreshXaiOAuthToken, xaiOAuthProvider } from "./xai-oauth.js";
+export type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "./xai-oauth.js";
 
 export const DEFAULT_X_SEARCH_MODEL = "grok-4.3";
 export const DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1";
@@ -85,6 +89,24 @@ export type ExtensionContextLike = {
 };
 
 export type ExtensionApiLike = {
+	registerProvider?(
+		name: string,
+		config: {
+			name?: string;
+			baseUrl?: string;
+			oauth?: {
+				name: string;
+				login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+				usesCallbackServer?: boolean;
+				refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+				getApiKey(credentials: OAuthCredentials): string;
+				modifyModels?(
+					models: Array<{ provider: string; baseUrl?: string }>,
+					credentials: OAuthCredentials,
+				): Array<{ provider: string; baseUrl?: string }>;
+			};
+		},
+	): void;
 	registerTool(tool: {
 		name: string;
 		label: string;
@@ -541,6 +563,12 @@ export async function executeXSearch(
 }
 
 export default function xSearchExtension(pi: ExtensionApiLike): void {
+	pi.registerProvider?.("xai-oauth", {
+		name: xaiOAuthProvider.name,
+		baseUrl: DEFAULT_XAI_BASE_URL,
+		oauth: xaiOAuthProvider,
+	});
+
 	pi.registerTool({
 		name: "x_search",
 		label: "X Search",

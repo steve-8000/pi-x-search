@@ -13,7 +13,8 @@ Then reload Senpi or start a new session.
 
 ## Auth
 
-The tool uses Senpi's existing credentials and never logs tokens.
+The package registers the `xai-oauth` login provider when Senpi loads the
+extension. The tool uses Senpi's credentials and never logs tokens.
 
 Credential priority:
 
@@ -26,6 +27,12 @@ Login with subscription credentials:
 senpi
 /login
 # choose xAI Grok OAuth
+```
+
+For package consumers that need the login module directly:
+
+```ts
+import { loginXaiOAuth, refreshXaiOAuthToken, xaiOAuthProvider } from "pi-x-search/xai-oauth";
 ```
 
 Or configure an API key for the `xai` provider.

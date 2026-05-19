@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
+import xSearchExtension, {
 	DEFAULT_X_SEARCH_MODEL,
 	buildXSearchPayload,
 	buildXSearchToolDefinition,
@@ -9,7 +9,10 @@ import {
 	extractInlineCitations,
 	extractResponseText,
 	normalizeHandles,
+	parseXaiAuthorizationInput,
 	resolveXaiCredential,
+	xaiOAuthProvider,
+	type ExtensionApiLike,
 	type ExtensionContextLike,
 	type FetchLike,
 } from "../src/index.ts";
@@ -42,6 +45,46 @@ test("resolveXaiCredential falls back to xai API key", async () => {
 
 	assert.deepEqual(credential, { source: "xai", apiKey: "api-key" });
 	assert.deepEqual(calls, ["xai-oauth", "xai"]);
+});
+
+test("xSearchExtension registers xai-oauth login provider", () => {
+	const providers: Array<Parameters<NonNullable<ExtensionApiLike["registerProvider"]>>> = [];
+	const pi: ExtensionApiLike = {
+		registerProvider(...args) {
+			providers.push(args);
+		},
+		registerTool() {},
+	};
+
+	xSearchExtension(pi);
+
+	assert.equal(providers.length, 1);
+	assert.equal(providers[0]?.[0], "xai-oauth");
+	assert.equal(providers[0]?.[1].oauth?.name, "xAI Grok OAuth");
+	assert.equal(providers[0]?.[1].oauth?.usesCallbackServer, true);
+	assert.equal(providers[0]?.[1].oauth?.getApiKey({ access: "oauth-token", refresh: "refresh", expires: 0 }), "oauth-token");
+});
+
+test("parseXaiAuthorizationInput accepts redirect URLs, query strings, and raw codes", () => {
+	assert.deepEqual(parseXaiAuthorizationInput("http://127.0.0.1:56121/callback?code=abc&state=state-1"), {
+		code: "abc",
+		state: "state-1",
+		error: undefined,
+		errorDescription: undefined,
+	});
+	assert.deepEqual(parseXaiAuthorizationInput("code=abc&state=state-1"), {
+		code: "abc",
+		state: "state-1",
+		error: undefined,
+		errorDescription: undefined,
+	});
+	assert.deepEqual(parseXaiAuthorizationInput("abc#state-1"), { code: "abc", state: "state-1" });
+	assert.deepEqual(parseXaiAuthorizationInput("abc"), { code: "abc" });
+});
+
+test("xaiOAuthProvider exposes access token as API key", () => {
+	assert.equal(xaiOAuthProvider.id, "xai-oauth");
+	assert.equal(xaiOAuthProvider.getApiKey({ access: "access-token", refresh: "refresh-token", expires: Date.now() }), "access-token");
 });
 
 test("normalizeHandles strips @, deduplicates, and enforces conflicts in tool payload", () => {
